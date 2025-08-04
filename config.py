@@ -12,8 +12,16 @@ sequence_len = 15
 
 working_dir = os.getcwd()
 
-train_dir = os.path.join(working_dir, "data_finance", "train", "1d")
-test_dir = os.path.join(working_dir, "data_finance", "test", "1d")
+train_dirs = {
+    "1d": os.path.join(working_dir, "data_finance", "train", "1d"),
+    "1wk": os.path.join(working_dir, "data_finance", "train", "1wk"),
+    "1mo": os.path.join(working_dir, "data_finance", "train", "1mo"),
+}
+test_dirs = {
+    "1d": os.path.join(working_dir, "data_finance", "test", "1d"),
+    "1wk": os.path.join(working_dir, "data_finance", "test", "1wk"),
+    "1mo": os.path.join(working_dir, "data_finance", "test", "1mo"),
+}
 
 results_dir = os.path.join(working_dir, "results")
 record_dir = os.path.join(working_dir, "records")
@@ -22,6 +30,7 @@ checkpoint_dir = os.path.join(working_dir, "checkpoints")
 num_parallel_trainings = 1
 
 model = CnnTa
+in_channels = 3
 class_weights = [1, 2, 2]
 
 train_years = [2017, 2022]
