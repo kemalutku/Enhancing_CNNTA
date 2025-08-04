@@ -1,131 +1,108 @@
-from sklearn.metrics import precision_recall_fscore_support
-from torch.utils.tensorboard import SummaryWriter
-from dataset import FinanceImageDataset
+# train.py ─── float-32 version (no AMP) ─────────────────────────────
+import os, random, numpy as np, torch, config
+from pathlib import Path
+from tqdm import trange, tqdm
 from torch.utils.data import DataLoader
-from test import trading
-import torch
-import config
-import os
-from model.focal_loss import FocalLoss
+
+from dataset.CnnTaDataset import FinanceImageDataset   # needs return_symbol=True patch
+from logger import TBLogger
+from trade import trading
+
+# ───────── reproducibility ─────────
+torch.manual_seed(42); np.random.seed(42); random.seed(42)
+torch.backends.cudnn.deterministic = False
+torch.backends.cudnn.benchmark     = True
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device:", device)
 
-model = config.model(apply_bn=config.apply_bn, window_length=config.window_length).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+# ───────── training loop ───────────
+def train() -> None:
+    model = config.model(window_length=config.sequence_len).to(device)
+    opt   = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+    crit  = torch.nn.CrossEntropyLoss(
+        weight=torch.tensor(config.class_weights, device=device)
+    )
 
-class_weights = torch.tensor([1, 1, 1]).to(device)
-# criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
-criterion = FocalLoss(alpha=class_weights, gamma=2.0)
+    # ---- data ----
+    train_ds = FinanceImageDataset(
+        config.train_dir,
+        config.indicators,
+        sequence_len=config.sequence_len,
+    )
+    train_ld = DataLoader(
+        train_ds, batch_size=config.batch_size, shuffle=True, pin_memory=True, drop_last=True
+    )
 
-writer = SummaryWriter('records/' + config.run_name)
-writer.add_text("HPARAMS", str(config.hparams), 0)
+    test_ds  = FinanceImageDataset(
+        config.test_dir,
+        config.indicators,
+        return_symbol=True,
+        sequence_len=config.sequence_len,
+    )
+    test_ld  = DataLoader(
+        test_ds, batch_size=config.batch_size, shuffle=False, pin_memory=True
+    )
 
-min_eval_loss = 999
+    logger = TBLogger(config.record_dir, config.run_name, comment="cnn-ta")
 
-train_dataset = FinanceImageDataset(config.train_dir, config.indicators, index_dir=config.train_index_dir,
-                                    use_index=config.use_index)
-train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, pin_memory=True)
+    for epoch in trange(config.max_epochs, desc="Epochs"):
 
-print("Start train session.")
-for epoch in range(config.max_epochs):
-    model.train()
+        # =================== TRAIN =================== #
+        model.train()
+        ep_loss, p_all, y_all = 0.0, [], []
 
-    epoch_loss = 0.0
-    all_predictions = []
-    all_labels = []
-    batch_count = 0
-    for _, _, images, labels in train_loader:
-        images, labels = images.to(device), labels.to(device)
-        optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
-        epoch_loss += loss.item()
-        batch_count += 1
+        for _, _, imgs, lbls in tqdm(train_ld, desc="Train", leave=False):
+            imgs, lbls = imgs.to(device, non_blocking=True), lbls.to(device, non_blocking=True)
 
-        all_predictions.extend(torch.argmax(outputs, dim=-1).cpu().numpy().flatten())
-        all_labels.extend(torch.argmax(labels, dim=-1).cpu().numpy().flatten())
+            opt.zero_grad(set_to_none=True)
+            outs  = model(imgs)
+            loss  = crit(outs, lbls)
+            loss.backward()
+            opt.step()
 
-    avg_loss = epoch_loss / batch_count if batch_count > 0 else 0
-    print(f"Average Training Loss for epoch: {epoch}: {avg_loss:.7f}", end="\t\t")
-    writer.add_scalar('Training/Loss', avg_loss, epoch)
+            ep_loss += loss.item()
+            p_all.extend(torch.argmax(outs, 1).cpu().tolist())
+            y_all.extend(torch.argmax(lbls, 1).cpu().tolist())
 
-    model.eval()
+        logger.log_epoch("train", epoch, ep_loss/len(train_ld),
+                         np.array(y_all), np.array(p_all))
 
-    trading_result = {
-        'Final Value': 0,
-        'Buy & Hold': 0,
-        'Annualized Return (%)': 0,
-        'Sharpe Ratio (daily)': 0,
-        'Trades Performed': 0,
-        'Trades Won': 0,
-        'Percent of Success': 0,
-        'Avg Profit per Trade (%)': 0,
-        'Avg Trade Length (days)': 0,
-        'Max Profit/Trade (%)': 0,
-        'Max Loss/Trade (%)': 0,
-        'Idle Ratio (%)': 0,
-        'Precision': 0,
-        'Recall': 0,
-        'F1': 0,
-    }
+        # =================== EVAL ==================== #
+        model.eval()
+        tot_loss, batches = 0.0, 0
+        p_all, y_all = [], []
+        by_symbol = {}
 
-    total_test_loss = 0.0
-    test_files = [os.path.join(config.test_dir, f) for f in os.listdir(config.test_dir)]
-    for tf in test_files:
-        test_dataset = FinanceImageDataset(tf, config.indicators, index_dir=config.test_index_dir,
-                                           use_index=config.use_index)
-        test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False)
-
-        all_predictions = []
-        all_labels = []
-        all_timestamps = []
-        all_close_candles = []
-        test_loss = 0.0
-        batch_count = 0
         with torch.no_grad():
-            for ts, closes, images, labels in test_loader:
-                images, labels = images.to(device), labels.to(device)
-                outputs = model(images)
-                loss = criterion(outputs, labels)
-                test_loss += loss.item()
+            for sym, ts, closes, imgs, lbls in tqdm(test_ld, desc="Eval", leave=False):
+                symbol = sym[0]
+                imgs, lbls = imgs.to(device), lbls.to(device)
+                outs  = model(imgs)
 
-                all_predictions.extend(torch.argmax(outputs, dim=-1).cpu().numpy().flatten())
-                all_labels.extend(torch.argmax(labels, dim=-1).cpu().numpy().flatten())
-                all_timestamps.extend(ts.flatten().cpu().numpy())
-                all_close_candles.extend(closes.flatten().cpu().numpy())
-                batch_count += 1
+                tot_loss += crit(outs, lbls).item()
+                batches  += 1
 
-            file_loss = test_loss / batch_count if batch_count > 0 else 0
-            total_test_loss += file_loss / len(test_files)
+                preds = torch.argmax(outs, 1).cpu().tolist()
+                labs  = torch.argmax(lbls, 1).cpu().tolist()
 
-        precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_predictions, average='macro',
-                                                                   zero_division=0)
+                p_all.extend(preds); y_all.extend(labs)
 
-        result, _ = trading(all_timestamps, all_close_candles, all_predictions)
+                bucket = by_symbol.setdefault(symbol, {"ts":[], "cl":[], "pr":[]})
+                bucket["ts"].extend(ts.cpu().tolist())
+                bucket["cl"].extend(closes.cpu().tolist())
+                bucket["pr"].extend(preds)
 
-        for key, item in result.items():
-            trading_result[key] += item / len(test_files)
+        logger.log_epoch("eval", epoch, tot_loss/batches,
+                         np.array(y_all), np.array(p_all))
 
-        trading_result['Precision'] += precision / len(test_files)
-        trading_result['Recall'] += recall / len(test_files)
-        trading_result['F1'] += f1 / len(test_files)
+        # ---- trading sim per symbol ----
+        trade_res = [trading(v["ts"], v["cl"], v["pr"])[0]
+                     for v in by_symbol.values()]
+        logger.log_trading(epoch, trade_res)
 
-    print(f"Test Loss : {total_test_loss:.7f}")
-    writer.add_scalar('Test/Loss', total_test_loss, epoch)
+    logger.close()
 
-    for key, item in trading_result.items():
-        writer.add_scalar(f'Test/{key}', item, epoch)
 
-    if total_test_loss < min_eval_loss:
-        # min_eval_loss = total_test_loss
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'loss': total_test_loss,
-        }, os.path.join(config.checkpoint_dir, f'{config.run_name}_checkpoint_epoch_{epoch}.pth'))
-
-writer.close()
+if __name__ == "__main__":
+    train()
+    print("✓ Training complete.")
